@@ -1091,6 +1091,10 @@ Body:
     Weight: 50
     Flags:
       BuyingStore: true
+      NoConsume: true # nostalRE: infinite, no Infinite Butterfly Wing exists; new characters start with one
+    Trade:
+      NoDrop: true
+      NoSell: true
     Script: |
       itemskill "AL_TELEPORT",3;
   - Id: 603
