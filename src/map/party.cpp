@@ -366,6 +366,13 @@ int32 party_recv_info(struct party* sp, uint32 char_id)
 
 	// nostalRE: companions go back in the free slots; real members win when the party is full
 	for( int32 c = 0; c < companion_count; ++c ) {
+		map_session_data* csd = companions[c].sd;
+
+		// released meanwhile (its owner withdrawn above): no longer this party's, and may be freed later
+		if( csd == nullptr || csd->pop.companion_owner == 0 || csd->status.party_id != sp->party_id ){
+			continue;
+		}
+
 		ARR_FIND( 0, MAX_PARTY, member_id, p->party.member[member_id].account_id == 0 );
 
 		if( member_id < MAX_PARTY ) {
@@ -1595,6 +1602,10 @@ void party_companion_remove( map_session_data& shell, enum e_party_member_withdr
 	party_data* p = party_search( shell.status.party_id );
 
 	if( p == nullptr ){
+		// its party is gone some other way: still a plain shell again, or wander and release skip it for good
+		if( shell.pop.companion_owner != 0 ){
+			population_engine_companion_released( shell );
+		}
 		return;
 	}
 

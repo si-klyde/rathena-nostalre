@@ -3925,6 +3925,7 @@ bool population_engine_companion_invite(map_session_data &owner, map_session_dat
 	shell.pop.companion_owner = owner.status.account_id;
 	shell.pop.companion_next_scan = 0;
 	shell.pop.behavior = static_cast<uint8_t>(PopulationBehavior::Combat);
+	shell.pop.companion_mortal = (shell.pop.flags & PSF::Mortal) != 0;
 	shell.pop.flags &= ~PSF::Mortal; // a mortal shell's respawn takes it back to its spawn point
 	population_shell_target_change(&shell, 0);
 	g_pop_companions.push_back(shell.id);
@@ -3939,6 +3940,9 @@ void population_engine_companion_released(map_session_data &shell)
 {
 	g_pop_companions.erase(std::remove(g_pop_companions.begin(), g_pop_companions.end(), shell.id), g_pop_companions.end());
 	shell.pop.companion_owner = 0;
+	if (shell.pop.companion_mortal)
+		shell.pop.flags |= PSF::Mortal;
+	shell.pop.companion_mortal = false;
 	shell.status.party_id = static_cast<int32>(0x70000000u | static_cast<uint32>(static_cast<uint16>(shell.m)));
 	shell.pop.behavior = shell.pop.behavior_base;
 	// a plain shell where it stands: the demand spawn lets it go once the map empties

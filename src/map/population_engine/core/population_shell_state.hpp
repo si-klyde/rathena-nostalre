@@ -178,6 +178,7 @@ struct s_population {
 	uint32 companion_owner = 0;     ///< Shell: account id of the player whose party it joined (0 = plain shell).
 	int32  companion_pending = 0;   ///< Player: id of the shell waiting for this player's new party (0 = none).
 	t_tick companion_next_scan = 0; ///< Shell: when to look for mobs around the owner again.
+	bool   companion_mortal = false; ///< Shell: had the Mortal flag before joining (given back on leaving).
 
 	// --- Skill fail tracking ---
 	t_tick last_skill_fail    = 0;  ///< Tick of last failed skill use.

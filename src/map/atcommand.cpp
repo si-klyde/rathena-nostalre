@@ -4322,6 +4322,9 @@ ACMD_FUNC(partyrecall)
 		{
 			if (pc_get_group_level(pl_sd) > pc_get_group_level(sd) || (pl_sd->m == sd->m && pl_sd->x == sd->x && pl_sd->y == sd->y))
 				continue; // Skip GMs greater than you...             or chars already on the cell
+			// nostalRE: a companion has no client to finish pc_setpos; it follows its owner by itself
+			if (IS_POPULATION_ENGINE_ACCOUNT_ID(pl_sd->status.account_id))
+				continue;
 			if (pl_sd->m >= 0 && map_getmapflag(pl_sd->m, MF_NOWARP) && !pc_has_permission(sd, PC_PERM_WARP_ANYWHERE))
 				count++;
 			else{
