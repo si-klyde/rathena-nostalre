@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cctype>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <set>
@@ -181,6 +182,194 @@ static int16_t population_roll_closed_range(int16_t a, int16_t b)
 		std::swap(a, b);
 	const uint32_t span = static_cast<uint32_t>(b - a) + 1u;
 	return static_cast<int16_t>(a + static_cast<int32_t>(rnd() % span));
+}
+
+// ---- nostalRE: map levels -------------------------------------------------
+// Autosummoned shells take their level from the map they spawn on, so a beginner field
+// holds low bots and Glast Heim high ones. Switch: population_engine_map_levels.
+// Arena and @populate shells keep the profile's range (or 99/70).
+
+/// Level of a map's monsters: mean of its permanent spawns, weighted by count, without
+/// bosses, MVPs and things that cannot attack (plants, eggs), which say little about who
+/// hunts there. 0 = no such spawns.
+///
+/// map_data::moblist holds every permanent spawn as long as dynamic_mobs is on (it is, in
+/// conf/battle/monster.conf) and the map has at most MAX_MOB_LIST_PER_MAP spawn lines (the
+/// busiest map has 94). Scripted `monster` commands are not spawns and are not in it.
+static int32_t population_map_mob_level(int16_t map_id)
+{
+	static std::unordered_map<int16_t, int32_t> cache;
+	const auto cached = cache.find(map_id);
+	if (cached != cache.end())
+		return cached->second;
+
+	const struct map_data* mapdata = map_getmapdata(map_id);
+	uint64_t level_sum = 0, count = 0;
+	for (int32 i = 0; mapdata != nullptr && i < MAX_MOB_LIST_PER_MAP; i++) {
+		const spawn_data* spawn = mapdata->moblist[i];
+		if (spawn == nullptr || spawn->state.boss)
+			continue;
+		const std::shared_ptr<s_mob_db> mob = mob_db.find(spawn->id);
+		if (mob == nullptr || mob->get_bosstype() != BOSSTYPE_NONE || !status_has_mode(&mob->status, MD_CANATTACK))
+			continue;
+		level_sum += static_cast<uint64_t>(spawn->level > 0 ? spawn->level : mob->lv) * spawn->num;
+		count += spawn->num;
+	}
+	const int32_t level = count > 0 ? static_cast<int32_t>((level_sum + count / 2) / count) : 0;
+	cache[map_id] = level;
+	if (mapdata != nullptr)
+		ShowInfo("Population engine: map '%s' has monster level %d (%" PRIu64 " monsters).\n", mapdata->name, level, count);
+	return level;
+}
+
+/// Roll a shell's base and job level for a map.
+///
+/// `map_category` 1 (town) and fields or dungeons with no monsters use a broad range:
+/// towns are where everybody meets. Niflheim counts as a town though it has monsters.
+/// Otherwise the roll is around the map's monster level.
+/// Then the class decides: a Knight needs a first job behind them, so on a Poring field
+/// they are a low Knight, not a level 3 one; first classes stop at 70, Novices at 15.
+static void population_roll_map_levels(uint16_t job_id, int16_t map_id, uint8_t map_category, int16_t& base_level, int16_t& job_level)
+{
+	static constexpr int32_t TOWN_LEVEL_MIN = 30, TOWN_LEVEL_MAX = 85, TOWN_LEVEL_SPREAD = 12;
+	const uint64 mapid = pc_jobid2mapid(job_id);
+	const int32_t max_base = static_cast<int32_t>(job_db.get_maxBaseLv(job_id));
+	const int32_t max_job = std::max(1, static_cast<int32_t>(job_db.get_maxJobLv(job_id)));
+	const uint64 base_class = mapid & MAPID_FIRSTMASK;
+
+	int32_t floor_level, cap;
+	if (mapid & JOBL_THIRD) {
+		floor_level = 99; cap = max_base;
+	} else if (mapid & JOBL_2) {
+		floor_level = (mapid & JOBL_UPPER) ? 60 : 45; cap = max_base;
+	} else if (base_class == MAPID_NOVICE) {
+		floor_level = 1; cap = 15;
+	} else if (base_class == MAPID_GUNSLINGER || base_class == MAPID_NINJA) {
+		floor_level = 10; cap = max_base; // no second class to move on to
+	} else {
+		floor_level = 10; cap = 70;
+	}
+	cap = std::min(cap, max_base);
+	floor_level = std::min(floor_level, cap);
+
+	const int32_t map_level = map_category == 1 ? 0 : population_map_mob_level(map_id);
+	int32_t lo, hi, spread;
+	if (map_level > 0) {
+		spread = std::max(3, map_level / 10);
+		lo = map_level - spread;
+		hi = map_level + spread;
+	} else {
+		spread = TOWN_LEVEL_SPREAD;
+		lo = TOWN_LEVEL_MIN;
+		hi = TOWN_LEVEL_MAX;
+	}
+	hi = std::min(std::max(hi, floor_level + spread), cap);
+	lo = std::max(std::min(lo, hi - spread), floor_level);
+	const int32_t base = std::max<int32_t>(population_roll_closed_range(static_cast<int16_t>(lo), static_cast<int16_t>(hi)), 1);
+
+	// Job levels come fast early on, hence the root: a level 60 Knight (range 45-99) is about job 26.
+	const double progress = cap > floor_level ? static_cast<double>(base - floor_level) / (cap - floor_level) : 1.0;
+	const int32_t jitter = max_job / 10;
+	const int32_t job = 1 + static_cast<int32_t>(std::sqrt(progress) * (max_job - 1))
+		+ population_roll_closed_range(static_cast<int16_t>(-jitter), static_cast<int16_t>(jitter));
+
+	base_level = static_cast<int16_t>(base);
+	job_level = static_cast<int16_t>(cap_value(job, 1, max_job));
+}
+
+/// Can a shell of this level wear the item? pc_equipitem refuses it otherwise, and the slot stays empty.
+static bool population_item_fits_level(uint16_t nameid, int32_t level)
+{
+	if (nameid == 0)
+		return true;
+	const std::shared_ptr<item_data> id = item_db.find(nameid);
+	return id != nullptr && level >= id->elv && (id->elvmax == 0 || level <= id->elvmax);
+}
+
+/// Pick from a gear pool. Only items wearable at `level`, unless `level` is negative (no map levels).
+static uint16_t population_pick_gear(const std::vector<uint16_t>& pool, int32_t level)
+{
+	if (pool.empty())
+		return 0;
+	if (level < 0)
+		return pool.size() == 1 ? pool[0] : pool[rnd() % pool.size()];
+	std::vector<uint16_t> wearable;
+	wearable.reserve(pool.size());
+	for (uint16_t nameid : pool) {
+		if (population_item_fits_level(nameid, level))
+			wearable.push_back(nameid);
+	}
+	return wearable.empty() ? 0 : wearable[rnd() % wearable.size()];
+}
+
+/// Weapon for a shell too low for its whole weapon pool: the plainest of the same kind,
+/// because the gear sets start at level 18-26 and a bare-handed Archer looks broken.
+static uint16_t population_starter_weapon(const std::vector<uint16_t>& pool, int32_t level)
+{
+	if (pool.empty())
+		return 0;
+	const std::shared_ptr<item_data> id = item_db.find(pool[0]);
+	if (id == nullptr || id->type != IT_WEAPON)
+		return 0;
+	uint16_t starter = 0;
+	switch (id->subtype) {
+		case W_DAGGER:   starter = 1201; break; // Knife
+		case W_1HSWORD:
+		case W_2HSWORD:  starter = 1101; break; // Sword
+		case W_MACE:     starter = 1501; break; // Club
+		case W_STAFF:
+		case W_2HSTAFF:  starter = 1601; break; // Rod
+		case W_BOW:      starter = 1701; break; // Bow
+		case W_REVOLVER: starter = 13100; break; // Six Shooter
+		default: break;
+	}
+	return population_item_fits_level(starter, level) ? starter : 0;
+}
+
+/// Fit a stat rolled for a profile's level range to the level the shell got, since a level
+/// 10 Knight with 80 STR could not exist. Profiles with no stats have no range to scale,
+/// so they get an even spread a character of that level could afford.
+static uint16_t population_scale_stat(uint16_t rolled, int32_t level, const PopulationEngine* pop_cfg, bool has_stat_range)
+{
+	int32_t stat;
+	if (has_stat_range) {
+		const int32_t ref_lo = (pop_cfg != nullptr && pop_cfg->base_level_min >= 0) ? pop_cfg->base_level_min : 99;
+		const int32_t ref_hi = (pop_cfg != nullptr && pop_cfg->base_level_max >= 0) ? pop_cfg->base_level_max : ref_lo;
+		stat = rolled * level / std::max(1, (ref_lo + ref_hi) / 2);
+	} else {
+		stat = population_roll_closed_range(static_cast<int16_t>(5 + level * 2 / 5), static_cast<int16_t>(5 + level * 3 / 5));
+	}
+	return static_cast<uint16_t>(cap_value(stat, 1, 99));
+}
+
+/// Points to raise a stat from 1, the same steps as pc_need_status_point up to 99.
+static int32_t population_stat_cost(int32_t stat)
+{
+	int32_t cost = 0;
+	for (int32_t value = 1; value < stat; value++)
+		cost += 2 + (value - 1) / 10;
+	return cost;
+}
+
+/// Shrink the six stats evenly until they cost no more than a character of this level has
+/// (db/re/statpoint.yml). The profile ranges alone do not guarantee it: they run to 2-3 times
+/// that, which makes low bots far stronger than a player of their level.
+static void population_fit_stats_to_level(mmo_charstatus& status, int32_t level)
+{
+	const int32_t budget = static_cast<int32_t>(statpoint_db.get_table_point(static_cast<uint16>(level)));
+	if (budget <= 0)
+		return;
+	uint16_t* const stats[] = { &status.str, &status.agi, &status.vit, &status.int_, &status.dex, &status.luk };
+	for (int32_t percent = 100; percent > 0; percent -= 5) {
+		int32_t cost = 0;
+		for (const uint16_t* stat : stats)
+			cost += population_stat_cost(std::max(1, *stat * percent / 100));
+		if (cost <= budget || percent == 5) {
+			for (uint16_t* stat : stats)
+				*stat = static_cast<uint16_t>(std::max(1, *stat * percent / 100));
+			return;
+		}
+	}
 }
 
 static PopulationNameProfile::Strategy population_effective_name_strategy(const PopulationNameProfile* prof)
@@ -450,7 +639,8 @@ static map_session_data* population_engine_spawn_shell(int16_t map_id, int x, in
 	uint16_t head_bottom, uint32_t option, uint16_t cloth_color, uint16_t garment,
 	struct script_code* init_script, bool skip_arrow, const PopulationEngine* pop_cfg,
 	uint8_t map_category = 0,
-	PopulationDbSource db_source = PopulationDbSource::Main);
+	PopulationDbSource db_source = PopulationDbSource::Main,
+	int16_t map_base_level = -1, int16_t map_job_level = -1);
 static std::string generate_bot_name(uint32_t index);
 static std::string generate_population_pc_name(uint32_t index, const PopulationEngine* cfg);
 static int16_t get_random_job_id();
@@ -580,6 +770,8 @@ void population_engine_shell_release(map_session_data* sd)
 	// torn down by another path; bail before any further access.
 	if (map_id2bl(sd->id) != sd)
 		return;
+	if (sd->pop.companion_owner != 0)
+		party_companion_remove(*sd, PARTY_MEMBER_WITHDRAW_LEAVE); // nostalRE: while its party id is the real one
 	sd->status.party_id = 0; // clear fake population party ID before teardown
 	g_pop_chat_next_tick.erase(sd->id);
 	population_engine_path_erase_for_pc(sd->id);
@@ -898,10 +1090,14 @@ static size_t autosummon_fill_map(int16_t map_id, size_t want, uint16_t job_hint
 		const uint16_t hair_color  = static_cast<uint16_t>(rnd() % 131);
 		const uint16_t cloth_color = static_cast<uint16_t>(rnd() % 699);
 
+		// nostalRE: the level comes first, since it decides what the shell can wear.
+		int16_t map_base_level = -1, map_job_level = -1;
+		if (battle_config.population_engine_map_levels)
+			population_roll_map_levels(job_id, map_id, map_category, map_base_level, map_job_level);
+
 		// Pick one item randomly from each equipment pool (empty pool = no item in that slot).
-		auto pick_pool = [](const std::vector<uint16_t>& p) -> uint16_t {
-			if (p.empty()) return 0;
-			return p.size() == 1 ? p[0] : p[rnd() % p.size()];
+		auto pick_pool = [map_base_level](const std::vector<uint16_t>& p) -> uint16_t {
+			return population_pick_gear(p, map_base_level);
 		};
 
 		uint16_t weapon = 0, shield = 0, head_top = 0, head_mid = 0, head_bottom = 0, garment = 0;
@@ -909,6 +1105,8 @@ static size_t autosummon_fill_map(int16_t map_id, size_t want, uint16_t job_hint
 		bool skip_arrow = false;
 		if (equipment) {
 			weapon      = pick_pool(equipment->weapon_pool);
+			if (weapon == 0 && map_base_level >= 0)
+				weapon = population_starter_weapon(equipment->weapon_pool, map_base_level);
 			shield      = pick_pool(equipment->shield_pool);
 			head_top    = pick_pool(equipment->head_top_pool);
 			head_mid    = pick_pool(equipment->head_mid_pool);
@@ -938,7 +1136,8 @@ static size_t autosummon_fill_map(int16_t map_id, size_t want, uint16_t job_hint
 		map_session_data* sd = population_engine_spawn_shell(
 			map_id, x, y, index, job_id, sex, hair_style,
 			hair_color, weapon, shield, head_top, head_mid, head_bottom,
-			0 /*option*/, cloth_color, garment, init_script, skip_arrow, pop_cfg, map_category, pre_src);
+			0 /*option*/, cloth_color, garment, init_script, skip_arrow, pop_cfg, map_category, pre_src,
+			map_base_level, map_job_level);
 
 		if (sd) {
 			g_population_engine_pcs.push_back(sd);
@@ -1046,7 +1245,8 @@ static void pop_release_vacant_shells(size_t max_global) {
 	while (it != g_population_engine_pcs.end()) {
 		map_session_data *sd = *it;
 		const bool candidate = sd != nullptr && sd->state.active && sd->prev != nullptr
-			&& sd->pop.arena_team == 0; // arena script owns its shells
+			&& sd->pop.arena_team == 0 // arena script owns its shells
+			&& sd->pop.companion_owner == 0; // nostalRE: its owner is here, or it is on its way to them
 		const bool keep = !candidate
 			|| (under_pressure ? g_pop_occupied_maps.count(sd->m) != 0 : pop_map_is_live(sd->m));
 		if (keep) {
@@ -1087,6 +1287,8 @@ TIMER_FUNC(population_engine_autosummon_timer)
 		if (!sd || !sd->state.active || sd->prev == nullptr)
 			continue;
 		if (sd->pop.spawn_map_id < 0 || sd->m == sd->pop.spawn_map_id)
+			continue;
+		if (sd->pop.companion_owner != 0) // nostalRE: goes where its owner goes
 			continue;
 		struct map_data *mapdata = map_getmapdata(sd->pop.spawn_map_id);
 		if (!mapdata)
@@ -1244,6 +1446,8 @@ TIMER_FUNC(population_engine_autosummon_timer)
 	return 0;
 }
 
+static void pop_companions_maintain(); // nostalRE
+
 /// Tick a single bot if it qualifies. Called for each block_list within range
 /// of a real PC. Dedupes via a per-pass set so two real PCs sharing view of the
 /// same bot don't double-tick it.
@@ -1306,6 +1510,8 @@ TIMER_FUNC(population_engine_global_combat_timer)
 
 	if (g_population_engine_pcs.empty())
 		return 0;
+
+	pop_companions_maintain(); // nostalRE: before the tick below, which only reaches shells near a player
 
 	// Proximity-driven tick: each real PC scans its viewport for bots.
 	// No round-robin / budget needed — work is bounded by real-player count.
@@ -1607,7 +1813,8 @@ static map_session_data* population_engine_spawn_shell(int16_t map_id, int x, in
 	uint16_t head_bottom, uint32_t option, uint16_t cloth_color, uint16_t garment,
 	struct script_code* init_script, bool skip_arrow, const PopulationEngine* pop_cfg,
 	uint8_t map_category,
-	PopulationDbSource db_source)
+	PopulationDbSource db_source,
+	int16_t map_base_level, int16_t map_job_level)
 {
 	PE_PERF_SCOPE("spawn_shell");
 	if (map_id < 0) {
@@ -1702,13 +1909,17 @@ static map_session_data* population_engine_spawn_shell(int16_t map_id, int x, in
 	sd->status.robe       = garment;
 	sd->status.option     = option;
 
-	if (pop_cfg != nullptr && pop_cfg->base_level_min >= 0) {
+	if (map_base_level >= 0) {
+		sd->status.base_level = map_base_level;
+	} else if (pop_cfg != nullptr && pop_cfg->base_level_min >= 0) {
 		const int16_t hi = pop_cfg->base_level_max >= 0 ? pop_cfg->base_level_max : pop_cfg->base_level_min;
 		sd->status.base_level = cap_value(population_roll_closed_range(pop_cfg->base_level_min, hi), 1, MAX_LEVEL);
 	} else {
 		sd->status.base_level = 99;
 	}
-	if (pop_cfg != nullptr && pop_cfg->job_level_min >= 0) {
+	if (map_job_level >= 0) {
+		sd->status.job_level = map_job_level;
+	} else if (pop_cfg != nullptr && pop_cfg->job_level_min >= 0) {
 		const int16_t hi = pop_cfg->job_level_max >= 0 ? pop_cfg->job_level_max : pop_cfg->job_level_min;
 		sd->status.job_level = cap_value(population_roll_closed_range(pop_cfg->job_level_min, hi), 1, MAX_LEVEL);
 	} else {
@@ -1749,6 +1960,15 @@ static map_session_data* population_engine_spawn_shell(int16_t map_id, int x, in
 		sd->status.luk = cap_value(static_cast<uint16_t>(population_roll_closed_range(pop_cfg->luk_min, hi)), 1, 999);
 	} else {
 		sd->status.luk = static_cast<uint16_t>(90 + (rnd() % 20));
+	}
+	if (map_base_level >= 0) {
+		sd->status.str  = population_scale_stat(sd->status.str,  map_base_level, pop_cfg, pop_cfg != nullptr && pop_cfg->str_min >= 0);
+		sd->status.agi  = population_scale_stat(sd->status.agi,  map_base_level, pop_cfg, pop_cfg != nullptr && pop_cfg->agi_min >= 0);
+		sd->status.vit  = population_scale_stat(sd->status.vit,  map_base_level, pop_cfg, pop_cfg != nullptr && pop_cfg->vit_min >= 0);
+		sd->status.int_ = population_scale_stat(sd->status.int_, map_base_level, pop_cfg, pop_cfg != nullptr && pop_cfg->intl_min >= 0);
+		sd->status.dex  = population_scale_stat(sd->status.dex,  map_base_level, pop_cfg, pop_cfg != nullptr && pop_cfg->dex_min >= 0);
+		sd->status.luk  = population_scale_stat(sd->status.luk,  map_base_level, pop_cfg, pop_cfg != nullptr && pop_cfg->luk_min >= 0);
+		population_fit_stats_to_level(sd->status, map_base_level);
 	}
 
 	// HP/SP placeholders — status_calc_pc() overwrites these from job_stats.yml (includes
@@ -2287,9 +2507,8 @@ static map_session_data* population_engine_spawn_shell(int16_t map_id, int x, in
     }
 
     if (pop_cfg != nullptr) {
-        auto pick_pool_cfg = [](const std::vector<uint16_t>& p) -> uint16_t {
-            if (p.empty()) return 0;
-            return p.size() == 1 ? p[0] : p[rnd() % p.size()];
+        auto pick_pool_cfg = [map_base_level](const std::vector<uint16_t>& p) -> uint16_t {
+            return population_pick_gear(p, map_base_level);
         };
         population_engine_shell_equip_item(sd, pick_pool_cfg(pop_cfg->armor_pool),   index, "armor");
         population_engine_shell_equip_item(sd, pick_pool_cfg(pop_cfg->shoes_pool),   index, "shoes");
@@ -3555,6 +3774,25 @@ bool population_engine_is_running() {
     return g_population_engine_running;
 }
 
+void population_engine_report_levels(int fd, int16_t map_id)
+{
+	char msg[CHAT_SIZE_MAX];
+	for (const map_session_data* psd : g_population_engine_pcs) {
+		if (psd == nullptr || psd->m != map_id)
+			continue;
+		const auto worn = [psd](int32 slot) -> uint32 {
+			const int16 i = psd->equip_index[slot];
+			return i >= 0 ? static_cast<uint32>(psd->inventory.u.items_inventory[i].nameid) : 0u;
+		};
+		safesnprintf(msg, sizeof(msg), "shell job %s lv %d/%d stats %d/%d/%d/%d/%d/%d weapon %u armor %u shoes %u hp %u/%u %s",
+			job_name(psd->status.class_), psd->status.base_level, psd->status.job_level,
+			psd->status.str, psd->status.agi, psd->status.vit, psd->status.int_, psd->status.dex, psd->status.luk,
+			worn(EQI_HAND_R), worn(EQI_ARMOR), worn(EQI_SHOES),
+			psd->status.hp, psd->status.max_hp, population_engine_shell_is_mortal(psd) ? "mortal" : "immortal");
+		clif_displaymessage(fd, msg);
+	}
+}
+
 size_t population_engine_get_count() {
 	return g_population_engine_count.load();
 }
@@ -3604,6 +3842,274 @@ void population_engine_combat_shell_stop(map_session_data *sd)
 	population_engine_combat_shell_teardown(sd);
 }
 
+// ============================================================
+// nostalRE: party companions
+//
+// A companion holds a member slot in its owner's real party on this map server only (party_companion_add): the party
+// window, skills and no-friendly-fire all work through the normal party code, and the char-server never hears of it.
+// Its damage is logged as the owner's (mob_log_damage), and it takes no EXP, zeny or items (party_exp_share,
+// party_share_loot). It leaves with its owner, and nothing brings it back after a restart.
+// ============================================================
+
+static std::vector<int32> g_pop_companions; // shell ids; the shells' own pop.companion_owner is what counts
+
+static constexpr int POP_COMPANION_WARP_CELLS = 20;      // further from the owner than this: warp, don't walk
+static constexpr int POP_COMPANION_STUCK_CELLS = 5;      // this far and not moving for
+static constexpr t_tick POP_COMPANION_STUCK_MS = 3000;   // this long: warp too
+
+static void pop_companion_whisper(map_session_data &to, map_session_data &shell, const char *message)
+{
+	if (session_isActive(to.fd))
+		clif_wis_message(&to, shell.status.name, message, strlen(message) + 1, pc_get_group_level(&shell));
+}
+
+/// Plain shells only, and not one that works here (vendors) or belongs to the arena script.
+static bool pop_companion_is_available(const map_session_data &shell)
+{
+	return battle_config.population_engine_companion_max > 0
+		&& shell.state.active && shell.prev != nullptr && !pc_isdead(const_cast<map_session_data *>(&shell))
+		&& shell.pop.arena_team == 0 && shell.pop.companion_owner == 0
+		&& !shell.state.vending && !shell.state.buyingstore
+		&& static_cast<PopulationBehavior>(shell.pop.behavior_base) != PopulationBehavior::Vendor;
+}
+
+/// A map a companion cannot follow to. An instance map is destroyed with shells on it by a path that warps them like
+/// players, and shells cannot take that warp.
+static bool pop_companion_map_is_closed(int16 m)
+{
+	struct map_data *mapdata = map_getmapdata(m);
+	return mapdata == nullptr || mapdata->instance_id != 0 || mapdata->getMapFlag(MF_BATTLEGROUND)
+		|| mapdata->getMapFlag(MF_PARTYLOCK) || mapdata_flag_gvg(mapdata);
+}
+
+bool population_engine_companion_invite(map_session_data &owner, map_session_data &shell)
+{
+	party_data *p = party_search(owner.status.party_id);
+	if (p == nullptr)
+		return false;
+	if (!population_engine_is_population_pc(shell.id) || !pop_companion_is_available(shell)) {
+		clif_party_invite_reply(owner, shell.status.name,
+			shell.pop.companion_owner != 0 ? PARTY_REPLY_JOIN_OTHER_PARTY : PARTY_REPLY_JOINMSG_REFUSE);
+		return false;
+	}
+	if (shell.m != owner.m || pop_companion_map_is_closed(owner.m)) {
+		clif_party_invite_reply(owner, shell.status.name, PARTY_REPLY_INVALID_MAPPROPERTY_ME);
+		return false;
+	}
+
+	int32 owned = 0;
+	for (const int32 id : g_pop_companions) {
+		const map_session_data *other = map_id2sd(id);
+		if (other != nullptr && other->pop.companion_owner == owner.status.account_id)
+			++owned;
+	}
+	if (owned >= battle_config.population_engine_companion_max) {
+		clif_party_invite_reply(owner, shell.status.name, PARTY_REPLY_FULL);
+		return false;
+	}
+
+	if (!population_engine_combat_start_session(&shell, PopulationCombatStartMode::AutoCombat, -1, SCSTART_NOAVOID).started) {
+		clif_party_invite_reply(owner, shell.status.name, PARTY_REPLY_REJECTED);
+		return false;
+	}
+	if (pc_issit(&shell)) {
+		pc_setstand(&shell, false);
+		clif_standing(shell);
+	}
+
+	if (!party_companion_add(*p, shell)) {
+		clif_party_invite_reply(owner, shell.status.name, PARTY_REPLY_FULL);
+		return false;
+	}
+
+	shell.pop.companion_owner = owner.status.account_id;
+	shell.pop.companion_next_scan = 0;
+	shell.pop.behavior = static_cast<uint8_t>(PopulationBehavior::Combat);
+	shell.pop.companion_mortal = (shell.pop.flags & PSF::Mortal) != 0;
+	shell.pop.flags &= ~PSF::Mortal; // a mortal shell's respawn takes it back to its spawn point
+	population_shell_target_change(&shell, 0);
+	g_pop_companions.push_back(shell.id);
+
+	clif_party_invite_reply(owner, shell.status.name, PARTY_REPLY_ACCEPTED);
+	clif_hpmeter_single(owner, shell.id, shell.battle_status.hp, shell.battle_status.max_hp);
+	pop_companion_whisper(owner, shell, "Sure, lead the way!");
+	return true;
+}
+
+void population_engine_companion_released(map_session_data &shell)
+{
+	g_pop_companions.erase(std::remove(g_pop_companions.begin(), g_pop_companions.end(), shell.id), g_pop_companions.end());
+	shell.pop.companion_owner = 0;
+	if (shell.pop.companion_mortal)
+		shell.pop.flags |= PSF::Mortal;
+	shell.pop.companion_mortal = false;
+	shell.status.party_id = static_cast<int32>(0x70000000u | static_cast<uint32>(static_cast<uint16>(shell.m)));
+	shell.pop.behavior = shell.pop.behavior_base;
+	// a plain shell where it stands: the demand spawn lets it go once the map empties
+	shell.pop.spawn_map_id = shell.m;
+	shell.pop.spawn_x = shell.x;
+	shell.pop.spawn_y = shell.y;
+	population_shell_target_change(&shell, 0);
+	if (shell.prev != nullptr && !pc_isdead(&shell)
+		&& static_cast<PopulationBehavior>(shell.pop.behavior_base) == PopulationBehavior::Sit) {
+		pc_setsit(&shell);
+		clif_sitting(shell);
+	}
+}
+
+void population_engine_companions_of_owner_leave(map_session_data &owner)
+{
+	owner.pop.companion_pending = 0;
+	const std::vector<int32> ids = g_pop_companions; // party_companion_remove edits the list
+	for (const int32 id : ids) {
+		map_session_data *shell = map_id2sd(id);
+		if (shell != nullptr && shell->pop.companion_owner == owner.status.account_id)
+			party_companion_remove(*shell, PARTY_MEMBER_WITHDRAW_LEAVE);
+	}
+}
+
+void population_engine_companion_party_ready(map_session_data &owner)
+{
+	const int32 id = owner.pop.companion_pending;
+	owner.pop.companion_pending = 0;
+	map_session_data *shell = map_id2sd(id);
+	if (shell != nullptr && population_engine_is_population_pc(shell->id))
+		party_invite(owner, shell);
+}
+
+void population_engine_companion_party_failed(map_session_data &owner)
+{
+	map_session_data *shell = map_id2sd(owner.pop.companion_pending);
+	owner.pop.companion_pending = 0;
+	if (shell != nullptr && population_engine_is_population_pc(shell->id))
+		pop_companion_whisper(owner, *shell, "We couldn't make a party. Try /organize, then invite me.");
+}
+
+map_session_data *population_engine_companion_owner(const map_session_data *sd)
+{
+	if (sd == nullptr || sd->pop.companion_owner == 0)
+		return nullptr;
+	return map_id2sd(sd->pop.companion_owner);
+}
+
+/// pc_setpos leaves the unit off the map until the client answers, and a shell has no client: this does what spawning
+/// and LoadEndAck do.
+static void pop_companion_warp_to_owner(map_session_data &shell, const map_session_data &owner)
+{
+	int16 x = owner.x, y = owner.y;
+	map_search_freecell(nullptr, owner.m, &x, &y, 2, 2, 1);
+
+	const bool map_changed = shell.m != owner.m;
+	population_shell_target_change(&shell, 0);
+	unit_remove_map_pc(&shell, CLR_TELEPORT);
+	shell.m = owner.m;
+	shell.mapindex = owner.mapindex;
+	shell.x = shell.ud.to_x = x;
+	shell.y = shell.ud.to_y = y;
+	if (map_addblock(&shell) != 0)
+		return; // the stale sweep cannot see this; the maintenance below tries again once prev is set
+	struct map_data *mapdata = map_getmapdata(shell.m);
+	if (mapdata->users++ == 0 && battle_config.dynamic_mobs)
+		map_spawnmobs(shell.m);
+	if (!pc_isinvisible(&shell))
+		mapdata->users_pvp++;
+	clif_spawn(&shell);
+	shell.pop.spawn_map_id = shell.m;
+	shell.pop.spawn_x = shell.x;
+	shell.pop.spawn_y = shell.y;
+	shell.pop.last_move = gettick();
+	if (map_changed)
+		party_companion_moved(shell);
+}
+
+/// The part of a companion's life the proximity tick cannot do: it only runs for shells near a player.
+static void pop_companions_maintain()
+{
+	if (g_pop_companions.empty())
+		return;
+	const t_tick now = gettick();
+	const std::vector<int32> ids = g_pop_companions; // party_companion_remove edits the list
+	for (const int32 id : ids) {
+		map_session_data *shell = map_id2sd(id);
+		if (shell == nullptr)
+			continue;
+		map_session_data *owner = population_engine_companion_owner(shell);
+		if (owner == nullptr) {
+			party_companion_remove(*shell, PARTY_MEMBER_WITHDRAW_LEAVE);
+			continue;
+		}
+		if (owner->prev == nullptr || owner->state.warping || shell->prev == nullptr)
+			continue; // on their way
+		if (owner->m != shell->m) {
+			if (pop_companion_map_is_closed(owner->m)) {
+				pop_companion_whisper(*owner, *shell, "I can't follow you in there. Invite me again when you're back!");
+				party_companion_remove(*shell, PARTY_MEMBER_WITHDRAW_LEAVE);
+			} else {
+				pop_companion_warp_to_owner(*shell, *owner);
+			}
+			continue;
+		}
+		const int dist = distance_bl(shell, owner);
+		const bool stuck = dist > POP_COMPANION_STUCK_CELLS && shell->pop.target_id == 0 && !unit_is_walking(shell)
+			&& DIFF_TICK(now, shell->pop.last_move) > POP_COMPANION_STUCK_MS;
+		if (dist > POP_COMPANION_WARP_CELLS || stuck)
+			pop_companion_warp_to_owner(*shell, *owner);
+	}
+}
+
+/// Whole words only: a whisper of "empty" or "accept" is not a party request ("pt").
+static bool pop_whisper_has_word(const char *message, std::initializer_list<const char *> words)
+{
+	const char *p = message;
+	while (*p != '\0') {
+		while (*p != '\0' && !ISALNUM(static_cast<unsigned char>(*p)))
+			++p;
+		const char *start = p;
+		while (ISALNUM(static_cast<unsigned char>(*p)))
+			++p;
+		const size_t len = static_cast<size_t>(p - start);
+		for (const char *word : words) {
+			if (len != 0 && strlen(word) == len && strncmpi(start, word, len) == 0)
+				return true;
+		}
+	}
+	return false;
+}
+
+/// A whispered "party": joins the player's party, making one for them when they have none.
+static void pop_companion_on_whispered_request(map_session_data &from, map_session_data &bot)
+{
+	if (bot.pop.companion_owner == from.status.account_id) {
+		pop_companion_whisper(from, bot, "I'm already with you.");
+		return;
+	}
+	if (!pop_companion_is_available(bot)) {
+		pop_companion_whisper(from, bot, "Sorry, I'm busy right now.");
+		return;
+	}
+	if (from.status.party_id != 0) {
+		if (!party_invite(from, &bot)) // says why
+			pop_companion_whisper(from, bot, "I can't join you right now.");
+		return;
+	}
+	if (from.party_creating || from.party_joining) {
+		pop_companion_whisper(from, bot, "One moment, your party isn't ready yet.");
+		return;
+	}
+	if (bot.m != from.m) {
+		pop_companion_whisper(from, bot, "Come and find me first.");
+		return;
+	}
+	char name[NAME_LENGTH];
+	// char_name_letters holds for party names too: letters, digits and spaces
+	safesnprintf(name, sizeof(name), "%.17s Party", from.status.name);
+	from.pop.companion_pending = bot.id; // party_recv_info finishes this when the party exists
+	if (party_create(from, name, 0, 0) != 1) {
+		from.pop.companion_pending = 0;
+		pop_companion_whisper(from, bot, "I can't join you right now.");
+	}
+}
+
 void population_engine_on_whisper_to_population_pc(map_session_data* from_sd, map_session_data* bot_sd, const char* message)
 {
 	if (!from_sd || !bot_sd || !message)
@@ -3613,24 +4119,16 @@ void population_engine_on_whisper_to_population_pc(map_session_data* from_sd, ma
 	if (!population_engine_is_population_pc(bot_sd->id))
 		return;
 
-	// Party request: if the player whispers a party-related keyword the shell accepts or
-	// creates a party and invites the player back (mirrors autocombat accept_party_request).
-	const bool has_msg = message[0] != '\0';
-	if (has_msg) {
-		const char* kw_party[]  = { "party", "pt", "join", "invite" };
-		bool is_party_request = false;
-		for (const char* kw : kw_party) {
-			if (stristr(message, kw) != nullptr) {
-				is_party_request = true;
-				break;
-			}
-		}
-		if (is_party_request) {
-			// nostalRE: shells never join or lead a real party until the companions feature: a fake
-			// char ID in a char-server party has no row to save. Upstream's accept/invite cases removed.
-			clif_wis_message(from_sd, bot_sd->status.name, "Sorry, I hunt alone.", strlen("Sorry, I hunt alone.") + 1, pc_get_group_level(bot_sd));
-			return;
-		}
+	// nostalRE: the shell only ever joins the player's party, on this map server. It never leads one: a fake char ID
+	// has no row for the char-server to save. Upstream's create-a-party-and-invite-back case is gone.
+	if (bot_sd->pop.companion_owner == from_sd->status.account_id && pop_whisper_has_word(message, { "leave", "bye", "dismiss" })) {
+		pop_companion_whisper(*from_sd, *bot_sd, "See you around!");
+		party_companion_remove(*bot_sd, PARTY_MEMBER_WITHDRAW_LEAVE);
+		return;
+	}
+	if (pop_whisper_has_word(message, { "party", "pt", "join", "invite" })) {
+		pop_companion_on_whispered_request(*from_sd, *bot_sd);
+		return;
 	}
 
 	population_engine_deliver_chat_reply_locked(bot_sd, from_sd);
@@ -4006,6 +4504,9 @@ bool population_engine_arena_is_ally(const map_session_data *a, const map_sessio
 {
     if (!a || !b || a == b)
         return false;
+    // nostalRE: a companion looks after its party like an ally shell looks after the arena player
+    if (a->pop.companion_owner != 0 && a->status.party_id == b->status.party_id)
+        return true;
     return population_engine_arena_relation(
         reinterpret_cast<const block_list*>(a),
         reinterpret_cast<const block_list*>(b)) > 0;

@@ -64,11 +64,26 @@ void population_engine_on_shell_damaged(map_session_data *sd, struct block_list 
 /// Called after a population shell kills a real (non-shell) player. Shell may trash-talk.
 void population_engine_on_shell_kills_player(map_session_data *killer_sd, map_session_data *victim_sd);
 size_t population_engine_get_count();
+/// nostalRE: one chat line for each shell on the map: level, stats and worn gear (@populate levels).
+void population_engine_report_levels(int fd, int16_t map_id);
 /// Stop combat mode for a population shell (teardown hat effect, cleanup, set state=false).
 /// Safe to call even if not in combat. Used by clif quit/restart paths.
 void population_engine_combat_shell_stop(map_session_data *sd);
 /// Whisper to a population PC: send one random chat line back to the sender (no fake-client packet).
 void population_engine_on_whisper_to_population_pc(map_session_data *from_sd, map_session_data *bot_sd, const char *message);
+/// nostalRE: party companions. A shell in a real player's party holds a member slot on this map server only.
+/// party_invite on a shell lands here; replies to `owner` and returns whether the shell joined.
+bool population_engine_companion_invite(map_session_data &owner, map_session_data &shell);
+/// The slot is gone (party.cpp): back to being a plain shell.
+void population_engine_companion_released(map_session_data &shell);
+/// `owner` is leaving their party or the server: their companions leave too.
+void population_engine_companions_of_owner_leave(map_session_data &owner);
+/// The party made for a whispered request exists / could not be made.
+void population_engine_companion_party_ready(map_session_data &owner);
+void population_engine_companion_party_failed(map_session_data &owner);
+/// The player `sd` fights for when it is a companion, else nullptr. `sd` may be nullptr.
+map_session_data *population_engine_companion_owner(const map_session_data *sd);
+
 /// Map chat: any population PC on the same map whose name appears in `message` (case-insensitive) may reply overhead.
 void population_engine_on_global_chat_mention(map_session_data *from_sd, const char *message);
 

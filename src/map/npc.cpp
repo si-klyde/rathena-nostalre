@@ -1934,6 +1934,10 @@ int32 npc_touch_areanpc(map_session_data* sd, int16 m, int16 x, int16 y, npc_dat
 	case NPCTYPE_WARP:
 		if ((!nd->trigger_on_hidden && (pc_ishiding(sd) || sd->sc.getSCE(SC_CAMOUFLAGE))) || pc_isdead(sd))
 			break; // hidden or dead chars cannot use warps
+		// nostalRE: a party companion follows its owner; with no client to finish pc_setpos, a portal would leave it
+		// off the map for the stale sweep
+		if (sd->pop.companion_owner != 0)
+			break;
 		if (!pc_job_can_entermap((enum e_job)sd->status.class_, map_mapindex2mapid(nd->u.warp.mapindex), pc_get_group_level(sd)))
 			break;
 		if (sd->count_rewarp > 10) {

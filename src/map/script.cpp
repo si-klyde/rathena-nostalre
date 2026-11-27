@@ -5863,6 +5863,10 @@ BUILDIN_FUNC(warpparty)
 		if( !(pl_sd = p->data[i].sd) || pl_sd->status.party_id != p_id )
 			continue;
 
+		// nostalRE: a companion has no client to finish pc_setpos; it follows its owner by itself
+		if( IS_POPULATION_ENGINE_ACCOUNT_ID( pl_sd->status.account_id ) )
+			continue;
+
 		map_data* mapdata = map_getmapdata(pl_sd->m);
 
 		if( str2 && strcmp(str2, mapdata->name) != 0 )
